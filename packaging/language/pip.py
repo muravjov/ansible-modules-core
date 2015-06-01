@@ -97,6 +97,14 @@ options:
     version_added: "1.3"
     required: false
     default: null
+  python_bin:
+    description:
+      - The explicit executable or a pathname to the executable to be used to
+        create I(virtualenv) for a specific version of Python installed in the system. For
+        example C(python3), if there are both Python 2 and 3 installations
+        in the system and you want to create virtualenv for Python 3 (virtualenv --python=python3).
+    required: false
+    default: null
 notes:
    - Please note that virtualenv (U(http://www.virtualenv.org/)) must be installed on the remote host if the virtualenv parameter is specified and the virtualenv needs to be initialized.
 requirements: [ "virtualenv", "pip" ]
@@ -136,6 +144,9 @@ EXAMPLES = '''
 
 # Install (Bottle) for Python 3.3 specifically,using the 'pip-3.3' executable.
 - pip: name=bottle executable=pip-3.3
+
+# Install specified python requirements in indicated (virtualenv), using Python 3.2.
+- pip: virtualenv=/my_app/venv requirements=/my_app/requirements.txt python_bin=python3.2
 '''
 
 def _get_cmd_options(module, cmd):
@@ -231,6 +242,7 @@ def main():
             extra_args=dict(default=None, required=False),
             chdir=dict(default=None, required=False),
             executable=dict(default=None, required=False),
+            python_bin=dict(default=None, required=False),
         ),
         required_one_of=[['name', 'requirements']],
         mutually_exclusive=[['name', 'requirements']],
@@ -263,14 +275,20 @@ def main():
             if os.path.basename(virtualenv) == virtualenv:
                 virtualenv = module.get_bin_path(virtualenv_command, True)
 
+            cmd = [virtualenv]
             if module.params['virtualenv_site_packages']:
-                cmd = '%s --system-site-packages %s' % (virtualenv, env)
+                cmd.append('--system-site-packages')
             else:
                 cmd_opts = _get_cmd_options(module, virtualenv)
                 if '--no-site-packages' in cmd_opts:
-                    cmd = '%s --no-site-packages %s' % (virtualenv, env)
-                else:
-                    cmd = '%s %s' % (virtualenv, env)
+                    cmd.append('--no-site-packages')
+            python_bin = module.params['python_bin']
+            if python_bin:
+                cmd.append("--python=%s" % python_bin)
+
+            cmd.append(env)
+            cmd = ' '.join(cmd)
+
             this_dir = tempfile.gettempdir()
             if chdir:
                 this_dir = os.path.join(this_dir, chdir)
