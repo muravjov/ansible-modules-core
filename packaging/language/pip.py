@@ -105,6 +105,7 @@ options:
         in the system and you want to create virtualenv for Python 3 (virtualenv --python=python3).
     required: false
     default: null
+    version_added: "2.0"
 notes:
    - Please note that virtualenv (U(http://www.virtualenv.org/)) must be installed on the remote host if the virtualenv parameter is specified and the virtualenv needs to be initialized.
 requirements: [ "virtualenv", "pip" ]
