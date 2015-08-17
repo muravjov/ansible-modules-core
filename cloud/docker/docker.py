@@ -355,15 +355,15 @@ HAS_DOCKER_PY = True
 
 import sys
 import json
-import re
 import os
 import shlex
 from urlparse import urlparse
 try:
     import docker.client
     import docker.utils
-    from requests.exceptions import *
-except ImportError, e:
+    import docker.errors
+    from requests.exceptions import RequestException
+except ImportError:
     HAS_DOCKER_PY = False
 
 if HAS_DOCKER_PY:
@@ -428,6 +428,13 @@ def get_split_image_tag(image):
 
     return resource, tag
 
+def normalize_image(image):
+    """
+    Normalize a Docker image name to include the implied :latest tag.
+    """
+
+    return ":".join(get_split_image_tag(image))
+
 
 def is_running(container):
     '''Return True if an inspected container is in a state we consider "running."'''
@@ -448,6 +455,7 @@ def get_docker_py_versioninfo():
                     if not char.isdigit():
                         nondigit = part[idx:]
                         digit = part[:idx]
+                        break
                 if digit:
                     version.append(int(digit))
                 if nondigit:
@@ -494,6 +502,7 @@ class DockerManager(object):
             'volumes_from': ((0, 3, 0), '1.10'),
             'restart_policy': ((0, 5, 0), '1.14'),
             'pid': ((1, 0, 0), '1.17'),
+            'host_config': ((0, 7, 0), '1.15'),
             # Clientside only
             'insecure_registry': ((0, 5, 0), '0.0')
             }
@@ -701,6 +710,52 @@ class DockerManager(object):
         else:
             return None
 
+    def get_start_params(self):
+        """
+        Create start params
+        """
+        params = {
+            'lxc_conf': self.lxc_conf,
+            'binds': self.binds,
+            'port_bindings': self.port_bindings,
+            'publish_all_ports': self.module.params.get('publish_all_ports'),
+            'privileged': self.module.params.get('privileged'),
+            'links': self.links,
+            'network_mode': self.module.params.get('net'),
+        }
+
+        optionals = {}
+        for optional_param in ('dns', 'volumes_from', 'restart_policy',
+                'restart_policy_retry', 'pid'):
+            optionals[optional_param] = self.module.params.get(optional_param)
+
+        if optionals['dns'] is not None:
+            self.ensure_capability('dns')
+            params['dns'] = optionals['dns']
+
+        if optionals['volumes_from'] is not None:
+            self.ensure_capability('volumes_from')
+            params['volumes_from'] = optionals['volumes_from']
+
+        if optionals['restart_policy'] is not None:
+            self.ensure_capability('restart_policy')
+            params['restart_policy'] = { 'Name': optionals['restart_policy'] }
+            if params['restart_policy']['Name'] == 'on-failure':
+                params['restart_policy']['MaximumRetryCount'] = optionals['restart_policy_retry']
+
+        if optionals['pid'] is not None:
+            self.ensure_capability('pid')
+            params['pid_mode'] = optionals['pid']
+
+        return params
+
+    def get_host_config(self):
+        """
+        Create HostConfig object
+        """
+        params = self.get_start_params()
+        return docker.utils.create_host_config(**params)
+
     def get_port_bindings(self, ports):
         """
         Parse the `ports` string into a port bindings dict for the `start_container` call.
@@ -837,6 +892,9 @@ class DockerManager(object):
         running = self.get_running_containers()
         current = self.get_inspect_containers(running)
 
+        #Get API version
+        api_version = self.client.version()['ApiVersion']
+
         image = self.get_inspect_image()
         if image is None:
             # The image isn't present. Assume that we're about to pull a new
@@ -899,7 +957,12 @@ class DockerManager(object):
             # MEM_LIMIT
 
             expected_mem = _human_to_bytes(self.module.params.get('memory_limit'))
-            actual_mem = container['Config']['Memory']
+
+            #For v1.19 API and above use HostConfig, otherwise use Config
+            if api_version >= 1.19:
+                actual_mem = container['HostConfig']['Memory']
+            else:
+                actual_mem = container['Config']['Memory']
 
             if expected_mem and actual_mem != expected_mem:
                 self.reload_reasons.append('memory ({0} => {1})'.format(actual_mem, expected_mem))
@@ -1115,17 +1178,23 @@ class DockerManager(object):
         if inspected:
             repo_tags = self.get_image_repo_tags()
         else:
-            image, tag = get_split_image_tag(self.module.params.get('image'))
-            repo_tags = [':'.join([image, tag])]
+            repo_tags = [normalize_image(self.module.params.get('image'))]
 
-        for i in self.client.containers(all=True):
-            running_image = i['Image']
-            running_command = i['Command'].strip()
-            match = False
+        for container in self.client.containers(all=True):
+            details = None
 
             if name:
-                matches = name in i.get('Names', [])
+                name_list = container.get('Names')
+                if name_list is None:
+                    name_list = []
+                matches = name in name_list
             else:
+                details = self.client.inspect_container(container['Id'])
+                details = _docker_id_quirk(details)
+
+                running_image = normalize_image(details['Config']['Image'])
+                running_command = container['Command'].strip()
+
                 image_matches = running_image in repo_tags
 
                 # if a container has an entrypoint, `command` will actually equal
@@ -1135,8 +1204,9 @@ class DockerManager(object):
                 matches = image_matches and command_matches
 
             if matches:
-                details = self.client.inspect_container(i['Id'])
-                details = _docker_id_quirk(details)
+                if not details:
+                    details = self.client.inspect_container(container['Id'])
+                    details = _docker_id_quirk(details)
 
                 deployed.append(details)
 
@@ -1184,11 +1254,16 @@ class DockerManager(object):
             self.module.fail_json(msg="Failed to pull the specified image: %s" % resource, error=repr(e))
 
     def create_containers(self, count=1):
+        try:
+            mem_limit = _human_to_bytes(self.module.params.get('memory_limit'))
+        except ValueError as e:
+            self.module.fail_json(msg=str(e))
+        api_version = self.client.version()['ApiVersion']
+
         params = {'image':        self.module.params.get('image'),
                   'command':      self.module.params.get('command'),
                   'ports':        self.exposed_ports,
                   'volumes':      self.volumes,
-                  'mem_limit':    _human_to_bytes(self.module.params.get('memory_limit')),
                   'environment':  self.env,
                   'hostname':     self.module.params.get('hostname'),
                   'domainname':   self.module.params.get('domainname'),
@@ -1197,6 +1272,15 @@ class DockerManager(object):
                   'stdin_open':   self.module.params.get('stdin_open'),
                   'tty':          self.module.params.get('tty'),
                   }
+        if self.ensure_capability('host_config', fail=False):
+            params['host_config'] = self.get_host_config()
+
+        #For v1.19 API and above use HostConfig, otherwise use Config
+        if api_version < 1.19:
+            params['mem_limit'] = mem_limit
+        else:
+            params['host_config']['mem_limit'] = mem_limit
+
 
         def do_create(count, params):
             results = []
@@ -1209,45 +1293,20 @@ class DockerManager(object):
 
         try:
             containers = do_create(count, params)
-        except:
+        except docker.errors.APIError as e:
+            if e.response.status_code != 404:
+                raise
+
             self.pull_image()
             containers = do_create(count, params)
 
         return containers
 
     def start_containers(self, containers):
-        params = {
-            'lxc_conf': self.lxc_conf,
-            'binds': self.binds,
-            'port_bindings': self.port_bindings,
-            'publish_all_ports': self.module.params.get('publish_all_ports'),
-            'privileged': self.module.params.get('privileged'),
-            'links': self.links,
-            'network_mode': self.module.params.get('net'),
-        }
+        params = {}
 
-        optionals = {}
-        for optional_param in ('dns', 'volumes_from', 'restart_policy',
-                'restart_policy_retry', 'pid'):
-            optionals[optional_param] = self.module.params.get(optional_param)
-
-        if optionals['dns'] is not None:
-            self.ensure_capability('dns')
-            params['dns'] = optionals['dns']
-
-        if optionals['volumes_from'] is not None:
-            self.ensure_capability('volumes_from')
-            params['volumes_from'] = optionals['volumes_from']
-
-        if optionals['restart_policy'] is not None:
-            self.ensure_capability('restart_policy')
-            params['restart_policy'] = { 'Name': optionals['restart_policy'] }
-            if params['restart_policy']['Name'] == 'on-failure':
-                params['restart_policy']['MaximumRetryCount'] = optionals['restart_policy_retry']
-
-        if optionals['pid'] is not None:
-            self.ensure_capability('pid')
-            params['pid_mode'] = optionals['pid']
+        if not self.ensure_capability('host_config', fail=False):
+            params = self.get_start_params()
 
         for i in containers:
             self.client.start(i['Id'], **params)
@@ -1454,7 +1513,6 @@ def main():
         manager = DockerManager(module)
         count = int(module.params.get('count'))
         name = module.params.get('name')
-        image = module.params.get('image')
         pull = module.params.get('pull')
 
         state = module.params.get('state')
@@ -1475,7 +1533,6 @@ def main():
             manager.pull_image()
 
         containers = ContainerSet(manager)
-        failed = False
 
         if state == 'present':
             present(manager, containers, count, name)
