@@ -1271,6 +1271,7 @@ class DockerManager(object):
                   'name':         self.module.params.get('name'),
                   'stdin_open':   self.module.params.get('stdin_open'),
                   'tty':          self.module.params.get('tty'),
+                  'labels': self.module.params.get('labels'),
                   }
         if self.ensure_capability('host_config', fail=False):
             params['host_config'] = self.get_host_config()
@@ -1501,6 +1502,7 @@ def main():
             net             = dict(default=None),
             pid             = dict(default=None),
             insecure_registry = dict(default=False, type='bool'),
+            labels          = dict(type='dict', default=None),
         ),
         required_together = (
             ['tls_client_cert', 'tls_client_key'],
