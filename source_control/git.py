@@ -159,7 +159,14 @@ options:
               C(no), submodules will be kept at the revision specified by the
               main project. This is equivalent to specifying the --remote flag
               to git submodule update.
-
+    merge:
+        required: false
+        default: "no"
+        choices: [ "yes", "no" ]
+        version_added: "1.9"
+        description:
+            - if C(yes), repository will be updated via delicate git merge instead of
+              "git reset --hard <upstream version>"; force=yes is also recommended 
 notes:
     - "If the task seems to be hanging, first verify remote host is in C(known_hosts).
       SSH will prompt user to authorize the first contact with a remote host.  To avoid this prompt, 
@@ -574,8 +581,9 @@ def submodule_update(git_path, module, dest, track_submodules):
     return (rc, out, err)
 
 
-def switch_version(git_path, module, dest, remote, version):
+def switch_version(git_path, module, dest, remote, version, is_merge):
     cmd = ''
+    update_cmd_prefix = "%s %s" % (git_path, 'merge' if is_merge else 'reset --hard')
     if version != 'HEAD':
         if is_remote_branch(git_path, module, dest, remote, version):
             if not is_local_branch(git_path, module, dest, version):
@@ -584,7 +592,7 @@ def switch_version(git_path, module, dest, remote, version):
                 (rc, out, err) = module.run_command("%s checkout --force %s" % (git_path, version), cwd=dest)
                 if rc != 0:
                     module.fail_json(msg="Failed to checkout branch %s" % version)
-                cmd = "%s reset --hard %s/%s" % (git_path, remote, version)
+                cmd = "%s %s/%s" % (update_cmd_prefix, remote, version)
         else:
             cmd = "%s checkout --force %s" % (git_path, version)
     else:
@@ -592,7 +600,7 @@ def switch_version(git_path, module, dest, remote, version):
         (rc, out, err) = module.run_command("%s checkout --force %s" % (git_path, branch), cwd=dest)
         if rc != 0:
             module.fail_json(msg="Failed to checkout branch %s" % branch)
-        cmd = "%s reset --hard %s" % (git_path, remote)
+        cmd = "%s %s" % (update_cmd_prefix, remote)
     (rc, out1, err1) = module.run_command(cmd, cwd=dest)
     if rc != 0:
         if version != 'HEAD':
@@ -623,6 +631,7 @@ def main():
             bare=dict(default='no', type='bool'),
             recursive=dict(default='yes', type='bool'),
             track_submodules=dict(default='no', type='bool'),
+            merge=dict(default='no', type='bool'),
         ),
         supports_check_mode=True
     )
@@ -729,7 +738,7 @@ def main():
     # switch to version specified regardless of whether
     # we got new revisions from the repository
     if not bare:
-        switch_version(git_path, module, dest, remote, version)
+        switch_version(git_path, module, dest, remote, version, module.params['merge'])
 
     # Deal with submodules
     submodules_updated = False
